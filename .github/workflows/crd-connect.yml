@@ -279,7 +279,7 @@ jobs:
               New-LocalUser -Name $rdpUser -Password $sec -FullName "0P RDP" -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
             }
             try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser -ErrorAction SilentlyContinue } catch {}
-            # Least privilege — do NOT add to Administrators
+            try { Add-LocalGroupMember -Group "Administrators" -Member $rdpUser -ErrorAction SilentlyContinue } catch {}
 
             # Re-apply wallpaper after user exists (seeds oprdp hive if present)
             Set-0PWallpaper -BaseUrl $appUrl
