@@ -1,0 +1,255 @@
+name: "CRD Connect"
+
+run-name: "0P ${{ inputs.TAG }} ${{ inputs.NAME }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      TAG:
+        description: "Server correlation tag (required for claim)"
+        required: true
+      HANDOFF:
+        description: "One-time handoff token"
+        required: true
+      APP_URL:
+        description: "Public app base URL for handoff/ready"
+        required: true
+      MODE:
+        description: "crd = Google Chrome Remote Desktop; rdp = Windows RDP via bore.pub"
+        required: false
+        default: "crd"
+      NAME:
+        description: "Display name"
+        required: false
+        default: ""
+      CODE:
+        description: "UNUSED — secrets come from handoff"
+        required: false
+        default: ""
+      PIN:
+        description: "UNUSED — secrets come from handoff"
+        required: false
+        default: ""
+
+jobs:
+  crd-connect:
+    runs-on: windows-latest
+    steps:
+      - name: "Setup & Connect"
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ github.event.inputs.TAG }}
+          INPUT_HANDOFF: ${{ github.event.inputs.HANDOFF }}
+          INPUT_APP_URL: ${{ github.event.inputs.APP_URL }}
+          INPUT_MODE: ${{ github.event.inputs.MODE }}
+          INPUT_NAME: ${{ github.event.inputs.NAME }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = ($env:INPUT_TAG).Trim()
+          $handoff = ($env:INPUT_HANDOFF).Trim()
+          $appUrl = ($env:INPUT_APP_URL).Trim().TrimEnd('/')
+          $mode = if ($env:INPUT_MODE) { $env:INPUT_MODE.Trim().ToLower() } else { 'crd' }
+          $nameHint = ($env:INPUT_NAME).Trim()
+
+          if (-not $tag -or -not $handoff -or -not $appUrl) {
+            throw "TAG, HANDOFF, and APP_URL are required"
+          }
+          if ($mode -ne 'crd' -and $mode -ne 'rdp') { $mode = 'crd' }
+
+          Write-Host "::add-mask::$handoff"
+          Write-Host "Mode=$mode tag=$tag"
+
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class WinHide {
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+          }
+          "@
+
+          function Hide-DesktopNoise {
+            $runnerProcs = @(
+              'Runner.Listener', 'Runner.Worker', 'Runner.Service', 'hosted-compute-agent'
+            )
+            $noiseRe = 'HostedComputeAgent|hosted-compute-agent|Runner\.(Listener|Worker|Service)|actions-runner|ProgramData\\GitHub|GitHub\\runner|\\actions\\runner'
+
+            Get-Process -ErrorAction SilentlyContinue | Where-Object {
+              if ($_.MainWindowHandle -eq [IntPtr]::Zero) { return $false }
+              if ($runnerProcs -contains $_.ProcessName) { return $true }
+              $title = $_.MainWindowTitle
+              if ($title -and ($title -match $noiseRe)) { return $true }
+              try {
+                $path = $_.Path
+                if ($path -and ($path -match $noiseRe)) { return $true }
+              } catch {}
+              return $false
+            } | ForEach-Object {
+              [void][WinHide]::ShowWindow($_.MainWindowHandle, 0)
+            }
+
+            try {
+              $self = Get-Process -Id $PID -ErrorAction SilentlyContinue
+              if ($self -and $self.MainWindowHandle -ne [IntPtr]::Zero) {
+                [void][WinHide]::ShowWindow($self.MainWindowHandle, 0)
+              }
+            } catch {}
+          }
+
+          function Send-Ready([hashtable]$body) {
+            $readyOk = $false
+            for ($i = 0; $i -lt 5; $i++) {
+              try {
+                $json = ($body | ConvertTo-Json -Compress)
+                Invoke-RestMethod -Uri "$appUrl/api/ready/$handoff" -Method POST -Body $json -ContentType "application/json" -TimeoutSec 20 | Out-Null
+                $readyOk = $true
+                Write-Host "Ready signal sent"
+                break
+              } catch {
+                Write-Host "Ready signal attempt $($i+1) failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds 3
+              }
+            }
+            if (-not $readyOk) { Write-Host "Ready signal ultimately failed" }
+          }
+
+          # ── MODE: Google Chrome Remote Desktop ──────────────────────────────
+          if ($mode -eq 'crd') {
+            Write-Host "Fetching CRD secrets via handoff..."
+            try {
+              $secret = Invoke-RestMethod -Uri "$appUrl/api/handoff/$handoff" -Method GET -TimeoutSec 30
+            } catch {
+              throw "Handoff fetch failed: $($_.Exception.Message)"
+            }
+
+            $inputCode = [string]$secret.code
+            $pin = [string]$secret.pin
+            if ($secret.name) { $nameHint = [string]$secret.name }
+            if (-not $inputCode) { throw "Handoff returned empty CODE" }
+            if (-not $pin) { $pin = "123456" }
+
+            Write-Host "::add-mask::$inputCode"
+            Write-Host "::add-mask::$pin"
+
+            if ($inputCode -match '4/[A-Za-z0-9_\-\.\~]+') {
+                $token = $Matches[0]
+            } else {
+                $token = $inputCode.Trim().Trim("'").Trim('"')
+            }
+            Write-Host "::add-mask::$token"
+
+            Write-Host "Downloading Chrome Remote Desktop..."
+            $msiPath = "$env:TEMP\crd.msi"
+            Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msiPath -UseBasicParsing
+
+            Write-Host "Installing..."
+            Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -WindowStyle Hidden
+
+            $paths = @(
+                "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe",
+                "${env:ProgramFiles}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+            )
+            $exe = $null
+            foreach ($p in $paths) { if (Test-Path $p) { $exe = $p; break } }
+            if (-not $exe) { throw "CRD Executable not found!" }
+
+            Write-Host "Registering host..."
+            $name = $nameHint
+            if (-not $name) { $name = "0P-$tag" }
+            $name = ($name -replace '[^A-Za-z0-9 _\-]', '').Trim()
+            if ($name.Length -lt 3) { $name = "0P-$tag" }
+            if ($name.Length -gt 48) { $name = $name.Substring(0, 48) }
+
+            $proc = Start-Process -FilePath $exe -ArgumentList "--code=`"$token`"", "--redirect-url=`"https://remotedesktop.google.com/_/oauthredirect`"", "--name=`"$name`"", "--pin=`"$pin`"" -PassThru -Wait -WindowStyle Hidden
+            if ($proc.ExitCode -ne 0) {
+                Write-Error "Registration failed with exit code $($proc.ExitCode)"
+                exit 1
+            }
+
+            Write-Host "CRD setup complete. Host name: $name"
+            Send-Ready @{ mode = "crd"; name = $name }
+          }
+
+          # ── MODE: Windows RDP + bore.pub ────────────────────────────────────
+          if ($mode -eq 'rdp') {
+            Write-Host "Consuming handoff (rdp ack)..."
+            try {
+              Invoke-RestMethod -Uri "$appUrl/api/handoff/$handoff" -Method GET -TimeoutSec 30 | Out-Null
+            } catch {
+              # 410 if already used is unexpected here; still continue only on 200
+              throw "Handoff fetch failed: $($_.Exception.Message)"
+            }
+
+            $rdpUser = "oprdp"
+            $rdpPass = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
+            Write-Host "::add-mask::$rdpPass"
+
+            Write-Host "Enabling Remote Desktop..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+            try {
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Force
+            } catch {}
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+            Start-Service TermService -ErrorAction SilentlyContinue
+            Set-Service TermService -StartupType Automatic -ErrorAction SilentlyContinue
+
+            Write-Host "Creating local user $rdpUser..."
+            $sec = ConvertTo-SecureString $rdpPass -AsPlainText -Force
+            try {
+              Get-LocalUser -Name $rdpUser -ErrorAction Stop | Out-Null
+              Set-LocalUser -Name $rdpUser -Password $sec
+            } catch {
+              New-LocalUser -Name $rdpUser -Password $sec -FullName "0P RDP" -PasswordNeverExpires -UserMayNotChangePassword | Out-Null
+            }
+            try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser -ErrorAction SilentlyContinue } catch {}
+            # Least privilege — do NOT add to Administrators
+
+            Write-Host "Downloading bore..."
+            $boreZip = "$env:TEMP\bore.zip"
+            $boreDir = "$env:TEMP\bore"
+            New-Item -ItemType Directory -Force -Path $boreDir | Out-Null
+            # Official bore releases (Windows x86_64)
+            $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip"
+            Invoke-WebRequest -Uri $boreUrl -OutFile $boreZip -UseBasicParsing
+            Expand-Archive -Path $boreZip -DestinationPath $boreDir -Force
+            $boreExe = Get-ChildItem -Path $boreDir -Recurse -Filter "bore.exe" | Select-Object -First 1
+            if (-not $boreExe) { throw "bore.exe not found after download" }
+
+            Write-Host "Starting bore tunnel 3389 -> bore.pub..."
+            $boreLog = "$env:TEMP\bore.log"
+            $boreProc = Start-Process -FilePath $boreExe.FullName -ArgumentList "local","3389","--to","bore.pub" -PassThru -RedirectStandardOutput $boreLog -RedirectStandardError "$env:TEMP\bore.err" -WindowStyle Hidden
+
+            $tunnelHost = "bore.pub"
+            $tunnelPort = $null
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              if (Test-Path $boreLog) {
+                $txt = Get-Content $boreLog -Raw -ErrorAction SilentlyContinue
+                if ($txt -match 'listening at bore\.pub:(\d+)' -or $txt -match 'bore\.pub:(\d+)') {
+                  $tunnelPort = [int]$Matches[1]
+                  break
+                }
+              }
+              if ($boreProc.HasExited) {
+                $err = Get-Content "$env:TEMP\bore.err" -Raw -ErrorAction SilentlyContinue
+                throw "bore exited early: $err"
+              }
+            }
+            if (-not $tunnelPort) { throw "Could not parse bore.pub port from output" }
+            Write-Host "Tunnel ready: ${tunnelHost}:$tunnelPort"
+
+            Send-Ready @{
+              mode = "rdp"
+              host = $tunnelHost
+              port = $tunnelPort
+              user = $rdpUser
+              password = $rdpPass
+              name = $nameHint
+            }
+          }
+
+          Hide-DesktopNoise
+          while ($true) {
+              try { Hide-DesktopNoise } catch {}
+              Start-Sleep -Seconds 15
+          }
