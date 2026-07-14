@@ -108,23 +108,15 @@ jobs:
               if (-not (Test-Path $wpPath)) { throw "Wallpaper download missing" }
 
               # Apply to current interactive session (CRD / console)
-              Add-Type @"
-              using System;
-              using System.Runtime.InteropServices;
-              public class OpWallpaper {
-                [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-                public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
-              }
-"@
+              $wpType = 'using System.Runtime.InteropServices; public class OpWallpaper { [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)] public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni); }'
+              Add-Type -TypeDefinition $wpType -ErrorAction SilentlyContinue
               $SPI_SETDESKWALLPAPER = 20
               $UPDATE_INI_FILE = 0x01
               $SENDWININICHANGE = 0x02
-              foreach ($style in @('10','6','2')) {
-                Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value $style -Force -ErrorAction SilentlyContinue
-                Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0' -Force -ErrorAction SilentlyContinue
-                Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $wpPath -Force -ErrorAction SilentlyContinue
-                [void][OpWallpaper]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $wpPath, $UPDATE_INI_FILE -bor $SENDWININICHANGE)
-              }
+              Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10' -Force -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0' -Force -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $wpPath -Force -ErrorAction SilentlyContinue
+              try { [void][OpWallpaper]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $wpPath, $UPDATE_INI_FILE -bor $SENDWININICHANGE) } catch {}
 
               # Seed Default user so first-login RDP profiles (oprdp) pick it up
               $defaultHive = 'C:\Users\Default\NTUSER.DAT'
@@ -166,13 +158,14 @@ jobs:
               $startupDir = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
               New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
               $cmdPath = Join-Path $startupDir "0P-set-wallpaper.cmd"
-              @"
-@echo off
-reg add "HKCU\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d "$wpPath" /f >nul
-reg add "HKCU\Control Panel\Desktop" /v WallpaperStyle /t REG_SZ /d 10 /f >nul
-reg add "HKCU\Control Panel\Desktop" /v TileWallpaper /t REG_SZ /d 0 /f >nul
-powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class W { [DllImport(\"user32.dll\",CharSet=CharSet.Auto)] public static extern bool SystemParametersInfo(int a,int b,string c,int d); }'; [W]::SystemParametersInfo(20,0,'$wpPath',3)"
-"@ | Set-Content -Path $cmdPath -Encoding ASCII
+              $cmdLines = @(
+                '@echo off',
+                ('reg add "HKCU\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d "{0}" /f >nul' -f $wpPath),
+                'reg add "HKCU\Control Panel\Desktop" /v WallpaperStyle /t REG_SZ /d 10 /f >nul',
+                'reg add "HKCU\Control Panel\Desktop" /v TileWallpaper /t REG_SZ /d 0 /f >nul',
+                ('powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -TypeDefinition ''using System.Runtime.InteropServices; public class W {{ [DllImport(\"\"user32.dll\"\",CharSet=CharSet.Auto)] public static extern bool SystemParametersInfo(int a,int b,string c,int d); }}''; [W]::SystemParametersInfo(20,0,''{0}'',3)"' -f $wpPath)
+              )
+              Set-Content -Path $cmdPath -Value $cmdLines -Encoding ASCII
             } catch {
               Write-Host "Wallpaper set failed (non-fatal): $($_.Exception.Message)"
             }
