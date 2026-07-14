@@ -15,7 +15,7 @@ on:
         description: "Public app base URL for handoff/ready"
         required: true
       MODE:
-        description: "crd = Google Chrome Remote Desktop; rdp = Windows RDP via bore.pub"
+        description: "crd = Google Chrome Remote Desktop; rdp = Windows RDP via Tailscale"
         required: false
         default: "crd"
       NAME:
@@ -247,13 +247,12 @@ jobs:
             Send-Ready @{ mode = "crd"; name = $name }
           }
 
-          # ── MODE: Windows RDP + bore.pub ────────────────────────────────────
+          # ── MODE: Windows RDP + Tailscale (login link) ──────────────────────
           if ($mode -eq 'rdp') {
             Write-Host "Consuming handoff (rdp ack)..."
             try {
               Invoke-RestMethod -Uri "$appUrl/api/handoff/$handoff" -Method GET -TimeoutSec 30 | Out-Null
             } catch {
-              # 410 if already used is unexpected here; still continue only on 200
               throw "Handoff fetch failed: $($_.Exception.Message)"
             }
 
@@ -281,47 +280,99 @@ jobs:
             try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser -ErrorAction SilentlyContinue } catch {}
             try { Add-LocalGroupMember -Group "Administrators" -Member $rdpUser -ErrorAction SilentlyContinue } catch {}
 
-            # Re-apply wallpaper after user exists (seeds oprdp hive if present)
             Set-0PWallpaper -BaseUrl $appUrl
 
-            Write-Host "Downloading bore..."
-            $boreZip = "$env:TEMP\bore.zip"
-            $boreDir = "$env:TEMP\bore"
-            New-Item -ItemType Directory -Force -Path $boreDir | Out-Null
-            # Official bore releases (Windows x86_64)
-            $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip"
-            Invoke-WebRequest -Uri $boreUrl -OutFile $boreZip -UseBasicParsing
-            Expand-Archive -Path $boreZip -DestinationPath $boreDir -Force
-            $boreExe = Get-ChildItem -Path $boreDir -Recurse -Filter "bore.exe" | Select-Object -First 1
-            if (-not $boreExe) { throw "bore.exe not found after download" }
+            $tsHost = if ($nameHint) { ($nameHint -replace '[^A-Za-z0-9\-]', '-').Trim('-') } else { "0P-$tag" }
+            if ($tsHost.Length -lt 3) { $tsHost = "0P-$tag" }
+            if ($tsHost.Length -gt 48) { $tsHost = $tsHost.Substring(0, 48) }
 
-            Write-Host "Starting bore tunnel 3389 -> bore.pub..."
-            $boreLog = "$env:TEMP\bore.log"
-            $boreProc = Start-Process -FilePath $boreExe.FullName -ArgumentList "local","3389","--to","bore.pub" -PassThru -RedirectStandardOutput $boreLog -RedirectStandardError "$env:TEMP\bore.err" -WindowStyle Hidden
+            Write-Host "Installing Tailscale..."
+            $msi = "$env:TEMP\tailscale-setup.msi"
+            $msiUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing -TimeoutSec 120
+            Start-Process msiexec.exe -ArgumentList "/i `"$msi`" TS_INSTALLUPDATES=0 /qn /norestart" -Wait -WindowStyle Hidden
 
-            $tunnelHost = "bore.pub"
-            $tunnelPort = $null
-            for ($i = 0; $i -lt 30; $i++) {
+            $tsExe = $null
+            foreach ($p in @(
+              "${env:ProgramFiles}\Tailscale\tailscale.exe",
+              "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+            )) {
+              if (Test-Path $p) { $tsExe = $p; break }
+            }
+            if (-not $tsExe) { throw "tailscale.exe not found after install" }
+
+            try { Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue } catch {}
+            Start-Sleep -Seconds 3
+
+            Write-Host "Starting Tailscale login (auth URL for user)..."
+            $tsOut = "$env:TEMP\ts-up.out"
+            $tsErr = "$env:TEMP\ts-up.err"
+            Remove-Item $tsOut, $tsErr -ErrorAction SilentlyContinue
+            $tsProc = Start-Process -FilePath $tsExe -ArgumentList @(
+              "up",
+              "--reset",
+              "--accept-dns=false",
+              "--hostname=$tsHost",
+              "--timeout=0"
+            ) -PassThru -RedirectStandardOutput $tsOut -RedirectStandardError $tsErr -WindowStyle Hidden
+
+            $authUrl = $null
+            for ($i = 0; $i -lt 90; $i++) {
               Start-Sleep -Seconds 1
-              if (Test-Path $boreLog) {
-                $txt = Get-Content $boreLog -Raw -ErrorAction SilentlyContinue
-                if ($txt -match 'listening at bore\.pub:(\d+)' -or $txt -match 'bore\.pub:(\d+)') {
-                  $tunnelPort = [int]$Matches[1]
-                  break
-                }
+              $blob = ""
+              if (Test-Path $tsOut) { $blob += (Get-Content $tsOut -Raw -ErrorAction SilentlyContinue) }
+              if (Test-Path $tsErr) { $blob += "`n" + (Get-Content $tsErr -Raw -ErrorAction SilentlyContinue) }
+              if ($blob -match 'https://login\.tailscale\.com/a/[A-Za-z0-9]+') {
+                $authUrl = $Matches[0]
+                break
               }
-              if ($boreProc.HasExited) {
-                $err = Get-Content "$env:TEMP\bore.err" -Raw -ErrorAction SilentlyContinue
-                throw "bore exited early: $err"
+              # Already logged in / keyed (rare on fresh runner)
+              try {
+                $st = & $tsExe status --json 2>$null | ConvertFrom-Json
+                if ($st -and $st.BackendState -eq 'Running') { break }
+              } catch {}
+            }
+
+            if ($authUrl) {
+              Write-Host "Tailscale auth URL captured"
+              Write-Host "::add-mask::$authUrl"
+              Send-Ready @{
+                mode = "rdp"
+                phase = "authorize"
+                tunnel = "tailscale"
+                auth_url = $authUrl
+                name = $nameHint
+              }
+            } else {
+              Write-Host "No auth URL yet — checking if already connected..."
+            }
+
+            Write-Host "Waiting for Tailscale to come online (user must open auth link)..."
+            $tsIp = $null
+            for ($i = 0; $i -lt 600; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                $st = & $tsExe status --json 2>$null | ConvertFrom-Json
+                if ($st -and $st.BackendState -eq 'Running') {
+                  $tsIp = (& $tsExe ip -4 2>$null | Select-Object -First 1)
+                  if ($tsIp) { $tsIp = $tsIp.Trim(); break }
+                }
+              } catch {}
+              if ($tsProc.HasExited -and -not $authUrl) {
+                $err = ""
+                if (Test-Path $tsErr) { $err = Get-Content $tsErr -Raw -ErrorAction SilentlyContinue }
+                throw "Tailscale up exited before auth: $err"
               }
             }
-            if (-not $tunnelPort) { throw "Could not parse bore.pub port from output" }
-            Write-Host "Tunnel ready: ${tunnelHost}:$tunnelPort"
+            if (-not $tsIp) { throw "Tailscale did not come online in time (auth link not completed?)" }
 
+            Write-Host "Tailscale online: $tsIp"
             Send-Ready @{
               mode = "rdp"
-              host = $tunnelHost
-              port = $tunnelPort
+              phase = "ready"
+              tunnel = "tailscale"
+              host = $tsIp
+              port = 3389
               user = $rdpUser
               password = $rdpPass
               name = $nameHint
